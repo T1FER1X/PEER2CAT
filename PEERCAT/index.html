@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"/>
+<title>P2P мессенджер — компактно</title>
+<style>
+:root{--bg:#0f1720;--panel:#0b1220;--accent:#3b82f6;--text:#e6eef8}
+*{box-sizing:border-box}body{margin:0;height:100vh;background:var(--bg);font-family:system-ui,Segoe UI,Roboto,Arial;display:flex;align-items:center;justify-content:center}
+.container{width:760px;height:600px;display:flex;gap:16px}
+.side{width:180px;background:#071226;border-radius:12px;padding:8px;display:flex;flex-direction:column}
+.side header{color:var(--text);font-weight:600;display:flex;justify-content:space-between;align-items:center}
+.chat-list{flex:1;overflow:auto;margin-top:8px;display:flex;flex-direction:column;gap:8px}
+.chat{display:flex;align-items:center;gap:8px;padding:8px;border-radius:8px;color:var(--text);cursor:pointer;border:1px solid transparent}
+.chat.active{background:linear-gradient(90deg,#0f2748,rgba(59,130,246,.08));border-color:rgba(59,130,246,.08)}
+.avatar{width:36px;height:36px;border-radius:8px;background:rgba(255,255,255,.04);display:flex;align-items:center;justify-content:center}
+.btn{background:transparent;border:1px solid rgba(255,255,255,.06);color:var(--text);padding:6px;border-radius:6px;cursor:pointer;font-size:12px}
+.app{flex:1;height:600px;background:var(--panel);border-radius:12px;display:flex;flex-direction:column;overflow:hidden}
+header{padding:12px;color:var(--text);display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid rgba(255,255,255,.03)}
+#messages{flex:1;padding:12px;overflow:auto;display:flex;flex-direction:column;gap:8px;background:linear-gradient(180deg,transparent,rgba(255,255,255,.01))}
+.msg{max-width:80%;padding:8px 10px;border-radius:10px;color:var(--text);font-size:14px;line-height:1.2;word-break:break-word}
+.mine{align-self:flex-end;background:linear-gradient(180deg,var(--accent),#2563eb)}
+.other{align-self:flex-start;background:rgba(255,255,255,.03)}
+footer{padding:10px;border-top:1px solid rgba(255,255,255,.03)}
+.input-row{display:flex;gap:8px}
+input{flex:1;padding:10px;border-radius:8px;border:1px solid rgba(255,255,255,.04);background:#071226;color:var(--text);outline:none}
+.send{padding:10px 12px;border-radius:8px;border:none;background:var(--accent);color:#fff;cursor:pointer}
+.small{font-size:12px;color:rgba(255,255,255,.6)}
+.empty{color:rgba(255,255,255,.35);text-align:center;margin-top:40%}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="side" aria-label="Чаты">
+    <header><div>Чаты</div><div id="wsst" class="small">ws: —</div></header>
+    <div id="chatList" class="chat-list"></div>
+    <button id="newChat" class="btn">+ Новый</button>
+  </div>
+
+  <div class="app" aria-label="Мессенджер">
+    <header><div id="title">Чат</div><div style="display:flex;gap:8px;align-items:center"><div id="myid" class="small"></div><button id="clear" class="btn">Очистить</button></div></header>
+    <div id="messages"></div>
+    <footer>
+      <div class="input-row">
+        <input id="input" maxlength="100" placeholder="Сообщение... (Enter)"/>
+        <button id="send" class="send">Отправить</button>
+      </div>
+      <div style="display:flex;justify-content:space-between;margin-top:6px"><div class="small">Макс 100</div><div id="cc" class="small">100</div></div>
+    </footer>
+  </div>
+</div>
+
+<script>
+/* --- Настройки --- */
+const SIGNAL = 'ws://localhost:8080'; // укажите ваш сигналинг
+const STUN = [{urls:'stun:stun.l.google.com:19302'}];
+const LIMIT = 100;
+const STORAGE = 'mini_p2p_v1';
+const UIDKEY = 'mini_p2p_uid';
+
+/* --- Идентификатор пользователя --- */
+function getUid(){ let id=localStorage.getItem(UIDKEY); if(!id){ const b=crypto.getRandomValues(new Uint8Array(16)); id=[...b].map(x=>x.toString(16).padStart(2,'0')).join(''); localStorage.setItem(UIDKEY,id);} return id;}
+const UID=getUid();
+document.getElementById('myid').textContent=UID.slice(0,8);
+
+/* --- Хранилище чатов --- */
+function load(){try{const r=localStorage.getItem(STORAGE);return r?JSON.parse(r):{streams:[{id:'inbox',name:'Личные',messages:[]}],active:'inbox'}}catch{return {streams:[],active:'inbox'}}}
+function save(s){try{localStorage.setItem(STORAGE,JSON.stringify(s))}catch{}}
+let state=load();
+
+/* --- WebSocket сигналинг --- */
+let ws=null;
+function connectWS(){
+  ws=new WebSocket(SIGNAL);
+  setStatus('connecting');
+  ws.onopen=()=>{ setStatus('open'); ws.send(JSON.stringify({type:'hello',id:UID})); }
+  ws.onclose=()=>{ setStatus('closed'); setTimeout(connectWS,2000); }
+  ws.onerror=()=>setStatus('error');
+  ws.onmessage=e=>{ try{const m=JSON.parse(e.data); if(m.type==='peers'){ peers=new Set((m.peers||[]).filter(id=>id!==UID)); renderList(); } else if(m.type==='signal'){ handleSignal(m.from,m.data); }}catch{} }
+}
+function setStatus(s){document.getElementById('wsst').textContent='ws: '+s}
+
+/* --- WebRTC --- */
+const pcs={}, dcs={};
+const peers=new Set();
+
+async function makePC(remote,initiator=false){
+  if(pcs[remote]) return pcs[remote];
+  const pc=new RTCPeerConnection({iceServers:STUN});
+  pcs[remote]=pc;
+  pc.onicecandidate=e=>{ if(e.candidate && ws && ws.readyState===1) ws.send(JSON.stringify({type:'signal',from:UID,to:remote,data:{type:'ice',candidate:e.candidate}})); }
+  pc.ondatachannel=e=>setupDC(remote,e.channel);
+  if(initiator){
+    const ch=pc.createDataChannel('chat'); setupDC(remote,ch);
+    const offer=await pc.createOffer(); await pc.setLocalDescription(offer);
+    if(ws&&ws.readyState===1) ws.send(JSON.stringify({type:'signal',from:UID,to:remote,data:{type:'sdp',sdp:pc.localDescription}}));
+  }
+  return pc;
+}
+
+function setupDC(remote,ch){
+  dcs[remote]=ch;
+  ch.onopen=()=>renderList();
+  ch.onclose=()=>{ delete dcs[remote]; renderList(); }
+  ch.onmessage=e=>{ try{const p=JSON.parse(e.data); pushMsg(remote,p.text,'peer',p.time||Date.now()); }catch{} }
+}
+
+/* --- Обработка сигналов --- */
+async function handleSignal(from,data){
+  if(!data) return;
+  if(data.type==='sdp' && data.sdp){
+    const pc=await makePC(from,false);
+    await pc.setRemoteDescription(data.sdp);
+    if(data.sdp.type==='offer'){ const ans=await pc.createAnswer(); await pc.setLocalDescription(ans); if(ws&&ws.readyState===1) ws.send(JSON.stringify({type:'signal',from:UID,to:from,data:{type:'sdp',sdp:pc.localDescription}})); }
+  } else if(data.type==='ice' && data.candidate){
+    const pc=pcs[from]; if(pc) pc.addIceCandidate(data.candidate).catch(()=>{});
+  }
+}
+
+/* --- UI и чат --- */
+const listEl=document.getElementById('chatList'), msgsEl=document.getElementById('messages'), titleEl=document.getElementById('title'), input=document.getElementById('input'), sendBtn=document.getElementById('send'), cc=document.getElementById('cc');
+
+function renderList(){
+  listEl.innerHTML='';
+  state.streams.forEach(s=>{
+    const el=document.createElement('div'); el.className='chat'+(s.id===state.active?' active':''); el.onclick=()=>{ state.active=s.id; save(state); renderMessages(); renderList(); };
+    const av=document.createElement('div'); av.className='avatar'; av.textContent=s.name.slice(0,2).toUpperCase();
+    const meta=document.createElement('div'); meta.style.flex='1';
+    const name=document.createElement('div'); name.textContent=s.name;
+    const last=document.createElement('div'); last.className='small'; last.textContent=(s.messages.length? s.messages[s.messages.length-1].text.slice(0,30):'Нет сообщений');
+    meta.appendChild(name); meta.appendChild(last);
+    el.appendChild(av); el.appendChild(meta);
+    // peer controls if id looks like uid
+    if(s.id.length===32){
+      const ctrl=document.createElement('div');
+      const online=peers.has(s.id);
+      const pc=pcs[s.id], dc=dcs[s.id];
+      const btn=document.createElement('button'); btn.className='btn';
+      btn.textContent = dc && dc.readyState==='open' ? 'Откр.' : (pc? (pc.iceConnectionState||'conn') : (online?'Подключ.':'Подключиться'));
+      btn.onclick=(ev)=>{ ev.stopPropagation(); startConnection(s.id); };
+      ctrl.appendChild(btn); el.appendChild(ctrl);
+    }
+    listEl.appendChild(el);
+  });
+  document.getElementById('wsst').textContent='ws: '+(ws&&ws.readyState===1?'open':(ws&&ws.readyState===0?'connecting':'closed'));
+}
+
+function renderMessages(){
+  const s=state.streams.find(x=>x.id===state.active); titleEl.textContent=s? s.name : 'Чат';
+  msgsEl.innerHTML='';
+  if(!s||!s.messages.length){ const e=document.createElement('div'); e.className='empty'; e.textContent='Пока нет сообщений.'; msgsEl.appendChild(e); return; }
+  s.messages.forEach(m=>{
+    const b=document.createElement('div'); b.className='msg '+(m.from==='me'?'mine':'other'); b.textContent=m.text;
+    const mt=document.createElement('div'); mt.className='small'; mt.style.marginTop='4px'; mt.textContent=m.time;
+    b.appendChild(mt); msgsEl.appendChild(b);
+  });
+  msgsEl.scrollTop=msgsEl.scrollHeight;
+}
+
+function pushMsg(streamId,text,from,time){
+  let s=state.streams.find(x=>x.id===streamId);
+  if(!s){ s={id:streamId,name:'Peer '+streamId.slice(0,6),messages:[]}; state.streams.unshift(s); }
+  s.messages.push({text,time:(new Date(time)).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}),from});
+  save(state); renderList(); renderMessages();
+}
+
+/* --- Действия --- */
+async function startConnection(remote){
+  await makePC(remote,true);
+}
+
+function sendActive(){
+  const txt=input.value.trim(); if(!txt) return;
+  const active=state.streams.find(x=>x.id===state.active); if(!active){ alert('Выберите чат'); return; }
+  // если peer — отправляем по dc, иначе сохраняем локально
+  if(active.id.length===32 && dcs[active.id] && dcs[active.id].readyState==='open'){
+    const payload={from:UID,text:txt,time:Date.now(),id:'m'+Date.now()};
+    dcs[active.id].send(JSON.stringify(payload));
+    pushMsg(active.id,txt,'me',Date.now());
+  } else {
+    // локальный чат
+    pushMsg(active.id,txt,'me',Date.now());
+  }
+  input.value=''; updateCount();
+}
+
+document.getElementById('newChat').onclick=()=>{
+  const name=prompt('Имя чата','Новый чат'); if(!name) return;
+  const id=prompt('Если привязан к peer — вставьте его userId (32 hex), иначе оставьте пустым:')||('local_'+Date.now());
+  const entry={id: (id.length===32? id : 'local_'+Date.now()), name, messages:[]};
+  state.streams.unshift(entry); state.active=entry.id; save(state); renderList(); renderMessages();
+};
+document.getElementById('clear').onclick=()=>{ if(confirm('Очистить все чаты?')){ state={streams:[],active:null}; save(state); state=load(); renderList(); renderMessages(); }};
+sendBtn.onclick=sendActive;
+input.addEventListener('keydown',e=>{ if(e.key==='Enter') sendActive(); });
+input.addEventListener('input',updateCount);
+function updateCount(){ cc.textContent = LIMIT - (input.value?input.value.length:0); }
+updateCount();
+
+/* --- Инициализация --- */
+if(!state.active && state.streams.length) state.active=state.streams[0].id;
+renderList(); renderMessages();
+connectWS();
+</script>
+</body>
+</html>
